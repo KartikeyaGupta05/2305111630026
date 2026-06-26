@@ -1317,3 +1317,232 @@ WHERE user_id = $1
 ---
  
 *End of Stage 2 — Database Design Document*
+
+---
+
+# Stage 3
+ 
+# Notification System — Query Analysis & Optimization
+ 
+## Query Analysis
+ 
+The query under review is:
+ 
+```sql
+SELECT * FROM notifications
+WHERE studentID = 1042 AND isRead = false
+ORDER BY createdAt ASC;
+```
+ 
+**Is it functionally correct?**
+ 
+The intent is correct — fetch all unread notifications for a specific student, ordered oldest first. However, the query as written will not execute successfully against the schema defined in Stage 2. There are three column name mismatches:
+ 
+| Query Column | Stage 2 Column | Issue |
+|---|---|---|
+| `studentID` | `user_id` | Wrong name and convention. Stage 2 uses `snake_case`. |
+| `isRead` | `is_read` | camelCase used instead of `snake_case`. |
+| `createdAt` | `created_at` | camelCase used instead of `snake_case`. |
+ 
+PostgreSQL column names are case-insensitive when unquoted, but `studentID` as a logical name simply does not exist — the column is called `user_id`. This query would throw an `ERROR: column "studentid" does not exist` at runtime.
+ 
+Additionally, the value `1042` is an integer literal, but `user_id` in Stage 2 is a `UUID`. The correct value must be a UUID string such as `'a3f1e290-4b72-4c1a-9b0f-d3e2f1c4a5b6'`. This likely reflects an older schema design where user IDs were auto-incrementing integers rather than UUIDs.
+ 
+The corrected query using Stage 2 column names is:
+ 
+```sql
+SELECT * FROM notifications
+WHERE user_id = 'a3f1e290-4b72-4c1a-9b0f-d3e2f1c4a5b6'
+  AND is_read = false
+ORDER BY created_at ASC;
+```
+ 
+Even after correcting column names, this query has significant performance problems at scale.
+ 
+---
+ 
+## Why the Query is Slow
+ 
+At 50,000 students and 5,000,000 notifications, this query is slow for several compounding reasons.
+ 
+**1. No usable index — full table scan**
+ 
+Without an index on `(user_id, is_read)`, PostgreSQL has no choice but to read every row in the `notifications` table to find the ones that match. On a 5,000,000-row table, that is a sequential scan of potentially hundreds of thousands of data pages. This is the dominant cost.
+ 
+**2. `SELECT *` reads every column unnecessarily**
+ 
+The query fetches all columns including `body` (TEXT, potentially long), `metadata` (JSONB), and `read_at` — most of which the caller likely does not need. PostgreSQL must read the full row from heap storage for each match, rather than satisfying the query from a covering index alone. This inflates I/O significantly.
+ 
+**3. Post-filter sort on an unindexed column**
+ 
+`ORDER BY created_at ASC` runs after filtering. If there is no index that already delivers rows in `created_at` order for a given user, PostgreSQL must collect all matching rows in memory and then sort them. On a student with hundreds of unread notifications, this sort is cheap — but without indexing, the cost of reaching that point (the full scan) is already unacceptable.
+ 
+**4. No pagination**
+ 
+`SELECT *` with no `LIMIT` returns every unread notification in one response. A student who has never opened the app could have thousands of unread rows. Fetching, sorting, serialising, and transmitting all of them in a single query is wasteful and slow regardless of indexing.
+ 
+**5. Large table, no partitioning**
+ 
+A single flat table of 5,000,000 rows with no archival or partitioning means every query operates against the full dataset. Even with an index, the index itself is large and may not fit entirely in memory, causing additional disk reads during traversal.
+ 
+---
+ 
+## Optimized Query
+ 
+**Step 1 — Fix column names and use correct types:**
+ 
+```sql
+SELECT
+    id,
+    title,
+    notification_type,
+    created_at,
+    read_at
+FROM notifications
+WHERE user_id  = $1
+  AND is_read  = false
+ORDER BY created_at ASC
+LIMIT 20
+OFFSET 0;
+```
+ 
+**Step 2 — Create the supporting index:**
+ 
+```sql
+-- Partial composite index: only unread rows, ordered by creation time
+CREATE INDEX idx_notifications_user_unread_created
+    ON notifications (user_id, created_at ASC)
+    WHERE is_read = false;
+```
+ 
+**What changed and why:**
+ 
+| Change | Reason |
+|---|---|
+| Replaced `SELECT *` with specific columns | Avoids reading `body` (TEXT) and `metadata` (JSONB) from heap storage when they are not needed. Reduces I/O per row. |
+| Added `LIMIT 20 OFFSET 0` | Prevents fetching the entire unread history in one query. Returns a usable, bounded result set. |
+| `ORDER BY created_at ASC` kept | Oldest-first ordering is preserved as originally intended. The partial index delivers rows pre-sorted, eliminating the sort step. |
+| Parameterised `$1` for `user_id` | Avoids query plan cache misses and prevents SQL injection. |
+| Partial index on `(user_id, created_at ASC) WHERE is_read = false` | Index only stores unread rows. As notifications are marked read, they leave the index automatically. The index stays small over time even as the table grows. |
+ 
+If `notification_type` filtering is also needed (as per Stage 1 API requirements), extend the index:
+ 
+```sql
+CREATE INDEX idx_notifications_user_type_unread_created
+    ON notifications (user_id, notification_type, created_at ASC)
+    WHERE is_read = false;
+```
+ 
+And the query becomes:
+ 
+```sql
+SELECT id, title, notification_type, created_at, read_at
+FROM notifications
+WHERE user_id           = $1
+  AND notification_type = $2
+  AND is_read           = false
+ORDER BY created_at ASC
+LIMIT 20
+OFFSET 0;
+```
+ 
+---
+ 
+## Computational Cost
+ 
+**Without any index:**
+ 
+PostgreSQL performs a sequential scan of the entire `notifications` table. Every one of the 5,000,000 rows is read and evaluated against the `WHERE` clause. This is **O(N)** where N is the total row count. At 5 million rows, this means reading potentially thousands of 8KB data pages from disk on every request. Response times in the range of seconds are expected. Under concurrent load, this saturates disk I/O quickly.
+ 
+**With the partial composite index `(user_id, created_at ASC) WHERE is_read = false`:**
+ 
+PostgreSQL uses a B-tree index scan. It navigates the index in **O(log N)** time to find the first entry for the given `user_id`, then reads only the contiguous index entries for that user's unread notifications in order. With `LIMIT 20`, it stops after retrieving 20 rows — it never touches the rest of the table.
+ 
+In practical terms:
+- Index lookup: a few milliseconds regardless of table size.
+- Heap fetch for 20 rows: negligible.
+- Sort step: eliminated entirely (index already delivers rows in `created_at ASC` order).
+- Total: response times consistently under 10ms for a typical student's unread notifications, even at 5 million total rows.
+| Scenario | Scan Type | Approximate Cost |
+|---|---|---|
+| No index, no limit | Full sequential scan | O(N) — degrades linearly with table size |
+| With partial index, LIMIT 20 | Index scan + 20 heap fetches | O(log N) — effectively constant at scale |
+ 
+---
+ 
+## Should Every Column be Indexed?
+ 
+No. Adding an index on every column is a common and costly mistake. Here is why.
+ 
+**Storage overhead**
+ 
+Each index is a separate B-tree data structure stored on disk. For a table with 5,000,000 rows and 9 columns, indexing every column could multiply storage usage by 3–5x. The `body` (TEXT) and `metadata` (JSONB) columns alone would produce enormous index structures with limited utility.
+ 
+**Slower writes**
+ 
+Every `INSERT`, `UPDATE`, and `DELETE` must update all indexes on the affected table, not just the ones relevant to the operation. Indexing every column means a single notification insert — which currently writes one row and updates 1–2 indexes — now writes one row and updates 9 indexes. Write throughput drops proportionally.
+ 
+**Query planner confusion**
+ 
+PostgreSQL's query planner evaluates available indexes when building an execution plan. Giving it many irrelevant indexes increases planning time and can lead the planner to choose a less efficient plan. More indexes is not always better guidance for the planner — it is noise.
+ 
+**Indexes are only valuable when selective**
+ 
+A boolean column like `is_read` has two possible values. A standalone index on `is_read` is nearly useless because it cannot narrow down the result set meaningfully — roughly half the table could match either value. Indexes deliver value when they are selective (high cardinality) and when they match actual query patterns.
+ 
+**The right approach:** create indexes that reflect the queries you run. Look at your `WHERE` clauses, `ORDER BY` columns, and join keys. Index those combinations, and nothing else.
+ 
+---
+ 
+## SQL Query: Students Receiving Placement Notifications in the Last 7 Days
+ 
+This query returns all distinct students who received at least one `Placement` notification within the last 7 days, along with the count of such notifications per student.
+ 
+```sql
+SELECT
+    n.user_id,
+    u.email,
+    COUNT(*)            AS placement_notification_count,
+    MAX(n.created_at)   AS most_recent_at
+FROM notifications n
+JOIN users u ON u.id = n.user_id
+WHERE n.notification_type = 'Placement'
+  AND n.created_at >= NOW() - INTERVAL '7 days'
+GROUP BY n.user_id, u.email
+ORDER BY most_recent_at DESC;
+```
+ 
+**Notes:**
+ 
+- `NOW() - INTERVAL '7 days'` is PostgreSQL-native and evaluates at query time. No application-side date arithmetic is needed.
+- The `JOIN` on `users` retrieves the student's email for readability. If only `user_id` is needed, the join can be dropped entirely.
+- `GROUP BY n.user_id, u.email` returns one row per student with the total count of placement notifications they received in the window.
+- `ORDER BY most_recent_at DESC` surfaces the most recently notified students first.
+**Supporting index for this query:**
+ 
+The following index from Stage 2 already covers this query efficiently:
+ 
+```sql
+CREATE INDEX idx_notifications_user_type_created
+    ON notifications (user_id, notification_type, created_at DESC);
+```
+ 
+PostgreSQL will use this index to satisfy both the `notification_type = 'Placement'` filter and the `created_at >= NOW() - INTERVAL '7 days'` range filter in a single index scan, without touching rows outside the time window.
+ 
+---
+ 
+## Summary
+ 
+| Question | Answer |
+|---|---|
+| Is the query correct? | Functionally intended but broken — three column names do not match the Stage 2 schema. `studentID` should be `user_id`, `isRead` should be `is_read`, `createdAt` should be `created_at`. |
+| Why is it slow? | No index on `(user_id, is_read)` forces a full sequential scan of 5,000,000 rows. `SELECT *` reads large columns unnecessarily. No `LIMIT` fetches unbounded results. |
+| How to fix it? | Add a partial composite index on `(user_id, created_at ASC) WHERE is_read = false`. Select only needed columns. Add `LIMIT` for pagination. |
+| Computational cost? | Without index: O(N) — scales badly. With the right partial index and `LIMIT`: O(log N) — effectively constant at scale. |
+| Index every column? | No. Adds storage overhead, slows writes, confuses the query planner, and provides no benefit for low-cardinality or rarely-queried columns. |
+| Placement query | Join `notifications` and `users`, filter `notification_type = 'Placement'` and `created_at >= NOW() - INTERVAL '7 days'`, group by student. |
+ 
+---
+ 
+*End of Stage 3 — Query Analysis & Optimization*
+ 
