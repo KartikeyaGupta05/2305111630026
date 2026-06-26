@@ -1449,7 +1449,7 @@ OFFSET 0;
 ---
  
 ## Computational Cost
- 
+
 **Without any index:**
  
 PostgreSQL performs a sequential scan of the entire `notifications` table. Every one of the 5,000,000 rows is read and evaluated against the `WHERE` clause. This is **O(N)** where N is the total row count. At 5 million rows, this means reading potentially thousands of 8KB data pages from disk on every request. Response times in the range of seconds are expected. Under concurrent load, this saturates disk I/O quickly.
@@ -1546,3 +1546,120 @@ PostgreSQL will use this index to satisfy both the `notification_type = 'Placeme
  
 *End of Stage 3 — Query Analysis & Optimization*
  
+---
+
+# Stage 4
+ 
+# Notification System — Performance Optimization & Caching Strategy
+ 
+## Problem Analysis
+ 
+The current behaviour is straightforward: every time a student opens the Notifications page, the frontend fires a request to the backend, the backend queries PostgreSQL, and the full result is returned. At small scale this is fine. At 50,000 students with 5,000,000 notifications, it becomes a reliability problem.
+ 
+**Why repeated full fetches hurt:**
+ 
+**Unnecessary database load.** If 5,000 students open the Notifications page within the same minute, that is 5,000 identical or near-identical queries hitting PostgreSQL simultaneously. Most of those students have not received a new notification since their last visit. The database is doing real work to return data that has not changed.
+ 
+**Repeated network round trips.** Each page load involves a full request-response cycle: DNS, TCP handshake, TLS negotiation (if not kept alive), request processing, database query, serialisation, and response transmission. Even with fast infrastructure, this adds latency that the user feels.
+ 
+**Higher response times under load.** Database connection pools are finite. When concurrent requests spike — a common pattern around placement season when all students check notifications at the same time — queries queue up waiting for a connection. Response times increase, timeouts follow, and the user experience degrades precisely when the system is needed most.
+ 
+**Poor scalability.** The current design makes database load a direct linear function of page loads. Doubling active users doubles database queries. There is no buffering between user behaviour and database pressure.
+ 
+**Bad user experience.** A loading spinner on every page visit, even when nothing has changed, feels slow and unnecessary. Notification systems are expected to feel instant.
+ 
+---
+ 
+## Performance Improvement Strategies
+ 
+### 1. Server-Side Caching
+ 
+Cache the results of common notification queries in a fast in-memory store (such as Redis) with a short TTL. When a student loads the Notifications page, the backend checks the cache first. If a valid cached response exists, it is returned immediately without touching PostgreSQL. The cache is invalidated when a new notification is created or when the student marks notifications as read.
+ 
+Cache keys are scoped per user and per query shape, for example: `notifications:{user_id}:page:1:limit:20` and `unread_count:{user_id}`.
+ 
+### 2. Client-Side Caching with HTTP Cache Headers
+ 
+The API responses for notification lists can carry standard HTTP cache headers (`ETag`, `Cache-Control`, `Last-Modified`). On subsequent requests, the client sends a conditional request with `If-None-Match` (ETag) or `If-Modified-Since`. If nothing has changed, the server responds with `304 Not Modified` and an empty body. The client renders from its local cache.
+ 
+This eliminates redundant data transfer even when the backend does need to check for changes. The check is cheap; the full payload transfer is avoided.
+ 
+### 3. Unread Count as a Lightweight Polling Target
+ 
+Rather than refetching the full notification list on every page load or on a timer, the client periodically polls only the lightweight `GET /notifications/unread-count` endpoint. This endpoint returns a small JSON object. If the count has changed since the last known value, the client fetches the updated list. If not, it skips the fetch entirely.
+ 
+This reduces full-list fetches to only when there is actually something new to show.
+ 
+### 4. Real-Time Push via Server-Sent Events
+ 
+As designed in Stage 1, the `/notifications/stream` SSE endpoint pushes new notification events to connected clients in real time. When a new notification is created, the client receives it immediately and updates the local notification list in place — without polling, without a full refetch, and without any database read triggered by the client.
+ 
+The client maintains a local in-memory list and appends incoming SSE events to it. The Notifications page renders from this local state rather than issuing a fresh request every time it is opened.
+ 
+### 5. Pagination and Lazy Loading
+ 
+The list endpoint already supports `page` and `limit` parameters. Rather than fetching all notifications upfront, the client fetches the first page (20 items) on load and defers further pages until the user scrolls. This reduces initial query cost and payload size, and most users never scroll far enough to trigger additional requests.
+ 
+### 6. Background Refresh with Stale-While-Revalidate
+ 
+The client renders the previously cached notification list immediately (zero perceived latency), then revalidates in the background. If the background fetch returns new data, the UI updates silently. This pattern — serve stale, revalidate in background — is appropriate for notification lists because slightly stale data is acceptable. The student sees instant load; fresh data arrives within seconds.
+ 
+### 7. Cache Invalidation on Write
+ 
+Server-side cache entries are invalidated on any write event: a new notification is inserted, or the student marks one or all notifications as read. This ensures the cache never serves stale data for longer than necessary, while still absorbing the read pressure between write events.
+ 
+---
+ 
+## Trade-off Comparison
+ 
+| Strategy | Advantages | Disadvantages | Best Use Case |
+|---|---|---|---|
+| **Server-side caching** | Drastically reduces DB load. Fast reads for all clients. Centralised invalidation. | Cache invalidation logic adds complexity. Stale data window exists between write and invalidation. Extra infrastructure (Redis) required. | High read volume, low write frequency. Unread count, paginated lists. |
+| **HTTP caching (ETag / 304)** | Zero data transfer on unchanged responses. Uses standard HTTP semantics. No extra infrastructure. | Server still processes the conditional request. Does not reduce DB load unless combined with server-side caching. Requires correct ETag generation. | API responses that change infrequently. Notification list for inactive students. |
+| **Unread count polling** | Very lightweight. Only triggers a full fetch when actually needed. Simple to implement. | Still polling — adds periodic requests. Not real-time; delay equals poll interval. | Badge counter updates. Reducing unnecessary full-list fetches. |
+| **Server-Sent Events (real-time push)** | True real-time delivery. No polling. Eliminates client-initiated fetch for new notifications. Native browser reconnect. | Persistent connection per user consumes server resources. Requires careful scaling (see Stage 1 §11.7). Not suitable for all network environments. | Active users who keep the app open. Instant notification delivery. |
+| **Pagination + lazy loading** | Minimises initial payload. DB only reads what is rendered. Works well with existing index design. | More complex client state management. User sees partial list initially. Not helpful for users who need to scan all notifications. | Long notification histories. Infinite scroll UI patterns. |
+| **Stale-while-revalidate** | Perceived instant load. Good UX for returning users. Reduces visible latency. | Slight risk of rendering outdated data briefly. Requires client-side cache management. | Returning users with an existing local cache. Notification list on re-open. |
+| **Cache invalidation on write** | Keeps cache consistent without a long TTL. Correctness improves. | Every write must trigger a cache invalidation call. If the invalidation fails, stale data persists. | Used alongside any server-side cache to maintain accuracy. |
+ 
+---
+ 
+## Recommended Solution
+ 
+No single strategy solves the problem in isolation. The recommended approach combines four complementary layers:
+ 
+**Layer 1 — Server-side cache for reads (Redis)**  
+Cache `GET /notifications` (per user, per page) and `GET /notifications/unread-count` with a short TTL (30–60 seconds). The vast majority of page loads are served from cache without touching PostgreSQL. Cache entries are invalidated immediately on any write event for that user.
+ 
+**Layer 2 — SSE for real-time delivery**  
+New notifications are pushed to connected clients via the `/notifications/stream` endpoint. The client appends the new notification to its local list and increments the badge counter in real time. This eliminates the need for the client to ever poll for new content.
+ 
+**Layer 3 — Pagination + lazy loading for the list**  
+The client fetches only the first page on load. Subsequent pages are fetched on scroll. This caps the initial database and network cost to a fixed, small amount regardless of how many notifications a student has accumulated.
+ 
+**Layer 4 — Stale-while-revalidate on the client**  
+On page open, the client renders the last known notification list from local state immediately. A background revalidation request runs concurrently. If new data arrives, the list updates. The student sees instant content on every visit.
+ 
+**Why this is better than fetching on every page load:**
+ 
+The database is read only when the cache is cold or has been invalidated by a write. For active users with an SSE connection open, the client maintains a live local state and never needs to refetch the full list. For returning users without an active connection, the stale-while-revalidate pattern provides instant perceived load followed by a silent background sync. The unread count badge, the most frequently observed element, is always accurate because it is driven by SSE push events rather than periodic polls.
+ 
+The overall effect is that database query volume becomes a function of write frequency rather than page load frequency — a fundamentally better scaling property.
+ 
+---
+ 
+## Summary
+ 
+| Layer | What it does | Problem it solves |
+|---|---|---|
+| Server-side cache (Redis) | Absorbs repeated read requests between write events | Eliminates redundant DB queries on every page load |
+| SSE push | Delivers new notifications to connected clients instantly | Removes client-initiated polling for new content |
+| Pagination + lazy loading | Caps initial fetch to 20 items | Reduces payload size and DB read cost per request |
+| Stale-while-revalidate | Renders cached data instantly, revalidates in background | Eliminates perceived load time for returning users |
+| Cache invalidation on write | Keeps cache accurate after read/mark operations | Prevents stale data from persisting after state changes |
+ 
+The combination shifts the system from a pull-heavy model — where every user action triggers a database read — to a push-assisted, cache-first model where the database is consulted only when something has actually changed.
+ 
+---
+ 
+*End of Stage 4 — Performance Optimization & Caching Strategy*
