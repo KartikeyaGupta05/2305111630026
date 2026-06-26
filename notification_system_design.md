@@ -1663,3 +1663,336 @@ The combination shifts the system from a pull-heavy model — where every user a
 ---
  
 *End of Stage 4 — Performance Optimization & Caching Strategy*
+
+---
+
+# Stage 5
+ 
+# Notification System — Reliable Broadcast Architecture
+ 
+## Existing Implementation Analysis
+ 
+The current implementation that runs when HR clicks **Notify All** is:
+ 
+```
+function notify_all(student_ids, message):
+    for student_id in student_ids:
+        send_email(student_id, message)      // calls Email API
+        save_to_db(student_id, message)      // DB insert
+        push_to_app(student_id, message)     // SSE / push
+```
+ 
+At first glance this looks reasonable. It loops over all students and performs three operations per student. The problem is that every design decision in this loop — sequential, synchronous, tightly coupled — is the wrong choice at 50,000 recipients. Each failure mode that this design ignores becomes a production incident.
+ 
+---
+ 
+## Shortcomings
+ 
+**Sequential processing.**  
+Students are processed one at a time. At even 10ms per student (optimistic for a network call to an email API), 50,000 students takes over 8 minutes. In practice, email API latency is 100–500ms, putting the realistic runtime at 1.5–7 hours. No notification system should take hours to complete a broadcast.
+ 
+**Blocking operations.**  
+`send_email()` is a synchronous network call to an external email provider. While it waits for a response, nothing else happens. The loop stalls on every single call. If the email API slows down, the entire broadcast slows down proportionally.
+ 
+**Tight coupling of three independent concerns.**  
+Saving to the database, sending an email, and pushing an in-app notification are three unrelated operations that serve different purposes, depend on different external systems, and can fail independently. Tying all three together inside a single loop means a failure in any one of them can block or corrupt the others.
+ 
+**No retry mechanism.**  
+If `send_email()` fails — due to a rate limit, a transient network error, or a provider outage — the error is thrown and the loop either crashes or skips the student silently. There is no attempt to retry. That student simply does not receive an email.
+ 
+**Single point of failure — no fault tolerance.**  
+If the process crashes at student 25,000 (midway through the loop), there is no record of who was successfully processed and who was not. The operation cannot safely resume. Re-running it would duplicate emails to the first 25,000 students.
+ 
+**No partial progress tracking.**  
+The function has no concept of a checkpoint. It cannot answer: *how many students have been notified?* or *which students are pending?* There is no visibility into the state of the broadcast.
+ 
+**Poor scalability.**  
+The function runs on a single thread or process. It cannot be distributed across multiple workers to run faster. Adding more servers does not help because there is only one execution unit.
+ 
+**No batching.**  
+Every student is processed individually. Most external email providers offer a batch send API that accepts hundreds of recipients per call. Calling the API 50,000 times individually is far slower and far more likely to hit rate limits than calling it 500 times with 100 recipients each.
+ 
+**No monitoring or observability.**  
+There is no way to know how far the broadcast has progressed, how many have succeeded, how many have failed, or when it will complete.
+ 
+---
+ 
+## Failure Scenario Analysis
+ 
+The logs show that `send_email()` fails after processing 200 students. Here is exactly what happens in the current implementation:
+ 
+**What happens to the remaining 49,800 students?**  
+They receive nothing. The loop has either crashed with an unhandled exception or, if errors are caught silently, the function has continued skipping the email step. Either way, the remaining students are not notified. There is no queuing, no retry, and no fallback. The failure is silent from the student's perspective.
+ 
+**What happens to database writes?**  
+This depends on where exactly the failure occurs. In the current design, `send_email()` is called *before* `save_to_db()`. If the email call fails and throws an exception that halts the loop, the database write for that student never happens. The first 200 students may have records in the database. The remaining 49,800 do not. The database is now in an inconsistent state that is difficult to reconcile.
+ 
+If the loop continues after the email failure, the database writes may succeed for later students even though their emails were not sent — creating a different inconsistency where the DB says "notified" but the student never received an email.
+ 
+**What happens to in-app push notifications?**  
+`push_to_app()` is called after `save_to_db()`. For the students whose loop iteration was interrupted by the email failure, neither the DB write nor the push notification occurred. The in-app notification never arrives.
+ 
+**Why is this a reliability issue?**  
+Three separate delivery channels — email, database record, and in-app push — are now in an unknown and inconsistent state. There is no way to determine which students received all three, which received some, and which received none, without manually querying external email provider logs against the database. Recovery requires a manual audit and a re-run with significant risk of duplication. This is a data integrity problem, a user trust problem, and an operational incident — all caused by a single transient email API failure.
+ 
+---
+ 
+## Database vs Email Processing
+ 
+**They should not happen together in the same synchronous operation.**
+ 
+Saving a notification to the database and sending an email are fundamentally different in nature:
+ 
+| Property | Database Write | Email Send |
+|---|---|---|
+| Dependency | Internal, controlled | External, uncontrolled (email provider) |
+| Latency | Milliseconds | 100ms–500ms+ |
+| Failure rate | Very low | Higher (rate limits, provider outages) |
+| Retry semantics | Idempotent with upsert | Must be deduplication-aware |
+| Consistency requirement | Strong (must not lose records) | Eventual (delivery within minutes is acceptable) |
+ 
+**The database write is the source of truth.** It should happen first, immediately, and independently of whether the email was successfully sent. Once a notification record exists in the database, the system knows who needs to be notified. Email delivery becomes a downstream concern that reads from that record.
+ 
+**Coupling them creates a consistency trap.** If the email fails, should the database write be rolled back? Rolling it back means the system has no record that delivery was attempted. Leaving it means the record says "notification created" but the email was never sent. Neither outcome is clean when both operations share the same transaction boundary.
+ 
+**The clean solution is decoupling via the write-ahead principle:** persist the notification record first (durable, fast, reliable), then asynchronously trigger email delivery as a separate process. If email delivery fails, the record already exists and the retry can safely re-attempt delivery without risk of duplication or lost state. The database write succeeds or fails on its own terms; email delivery succeeds or fails on its own terms.
+ 
+This is the standard pattern in reliable distributed systems: **store first, deliver asynchronously**.
+ 
+---
+ 
+## Redesigned Architecture
+ 
+The redesigned system separates the broadcast into three stages: **intake**, **fan-out**, and **delivery**.
+ 
+```
+HR clicks Notify All
+        │
+        ▼
+┌───────────────────┐
+│   API Layer       │  Validates request, creates one
+│  (Intake)         │  NotificationJob record in DB
+└────────┬──────────┘
+         │ Enqueues single broadcast job
+         ▼
+┌───────────────────┐
+│  Job Queue        │  Durable message queue
+│  (Broadcast)      │  e.g. broadcast_queue
+└────────┬──────────┘
+         │
+         ▼
+┌───────────────────┐
+│  Fan-Out Worker   │  Reads student_ids in batches
+│                   │  Writes one notification row
+│                   │  per student to DB
+│                   │  Enqueues per-student delivery jobs
+└────────┬──────────┘
+         │
+         ├─────────────────────────────┐
+         ▼                             ▼
+┌─────────────────┐         ┌─────────────────────┐
+│  Email Queue    │         │  Push Queue          │
+└────────┬────────┘         └─────────┬────────────┘
+         │                            │
+         ▼                            ▼
+┌─────────────────┐         ┌─────────────────────┐
+│  Email Worker   │         │  Push Worker         │
+│  (batched)      │         │  (SSE / in-app)      │
+└────────┬────────┘         └─────────┬────────────┘
+         │ on failure                 │ on failure
+         ▼                            ▼
+┌─────────────────┐         ┌─────────────────────┐
+│  Retry Queue    │         │  Retry Queue         │
+│  (exp. backoff) │         │  (exp. backoff)      │
+└────────┬────────┘         └─────────┬────────────┘
+         │ after max retries           │ after max retries
+         ▼                            ▼
+┌─────────────────┐         ┌─────────────────────┐
+│  Dead Letter    │         │  Dead Letter Queue   │
+│  Queue (DLQ)    │         │  (DLQ)               │
+└─────────────────┘         └─────────────────────┘
+```
+ 
+**Flow description:**
+ 
+1. **Intake.** The API receives the HR request. It validates the input, creates a single `notification_job` record in the database with status `PENDING`, and enqueues one broadcast job message. The API responds immediately with `202 Accepted`. The HR's browser does not wait for 50,000 emails.
+2. **Fan-Out Worker.** A background worker picks up the broadcast job. It reads student IDs in batches (e.g. 500 at a time). For each batch, it writes notification rows to the `notifications` table and enqueues one delivery job per student (or per batch, for email) onto the `email_queue` and `push_queue`. Database writes are committed before any delivery is attempted.
+3. **Email Worker.** Consumes jobs from `email_queue`. Sends emails in batches to the email provider API (e.g. 100 recipients per API call). On success, updates the notification record's `email_sent_at` field. On failure, moves the job to the retry queue.
+4. **Push Worker.** Consumes jobs from `push_queue`. Publishes the notification event to each student's SSE channel (as designed in Stage 1 and Stage 4). On failure, moves to the retry queue.
+5. **Retry Queue.** Failed jobs are re-queued with exponential backoff (e.g. retry after 30s, 2min, 10min). A maximum retry count is enforced per job.
+6. **Dead Letter Queue (DLQ).** Jobs that exhaust all retries land in the DLQ. An alert fires. An operator can inspect the failed jobs, identify the root cause, and manually replay them once the underlying issue is resolved.
+**Key design properties:**
+- The API always responds fast. HR sees immediate confirmation.
+- The database is written before delivery is attempted. State is never lost.
+- Email and push are independent. A push failure does not affect email delivery.
+- Each worker can be scaled horizontally. 10 email workers process 10x faster.
+- A worker crash at any point is recoverable. Unacknowledged queue messages are redelivered automatically.
+---
+ 
+## Revised Pseudocode
+ 
+```
+// ─── STEP 1: API Intake ───────────────────────────────────────────
+ 
+FUNCTION handle_notify_all(request):
+    validate(request.message, request.notification_type)
+ 
+    job_id = generate_uuid()
+ 
+    DB.insert into notification_jobs:
+        id            = job_id
+        message       = request.message
+        type          = request.notification_type
+        status        = "PENDING"
+        total_count   = count(request.student_ids)
+        created_at    = NOW()
+ 
+    broadcast_queue.enqueue({
+        job_id      : job_id,
+        student_ids : request.student_ids,
+        message     : request.message,
+        type        : request.notification_type
+    })
+ 
+    RETURN 202 Accepted, { job_id: job_id }
+ 
+ 
+// ─── STEP 2: Fan-Out Worker ───────────────────────────────────────
+ 
+WORKER fan_out_worker CONSUMES broadcast_queue:
+ 
+    ON receive(job):
+        batches = split(job.student_ids, batch_size = 500)
+ 
+        FOR EACH batch IN batches:
+ 
+            DB.bulk_insert into notifications:
+                FOR EACH student_id IN batch:
+                    id                = generate_uuid()
+                    user_id           = student_id
+                    title             = job.message.title
+                    body              = job.message.body
+                    notification_type = job.type
+                    is_read           = false
+                    created_at        = NOW()
+ 
+            email_queue.enqueue({
+                job_id      : job.job_id,
+                student_ids : batch,
+                message     : job.message
+            })
+ 
+            push_queue.enqueue({
+                job_id      : job.job_id,
+                student_ids : batch,
+                message     : job.message
+            })
+ 
+        DB.update notification_jobs SET status = "QUEUED" WHERE id = job.job_id
+ 
+        ACKNOWLEDGE job
+ 
+ 
+// ─── STEP 3: Email Worker ─────────────────────────────────────────
+ 
+WORKER email_worker CONSUMES email_queue:
+ 
+    ON receive(job):
+        TRY:
+            email_provider.send_batch(
+                recipients : job.student_ids,
+                subject    : job.message.title,
+                body       : job.message.body
+            )
+            ACKNOWLEDGE job
+ 
+        ON FAILURE:
+            IF job.retry_count < MAX_RETRIES:
+                retry_queue.enqueue(job, delay = backoff(job.retry_count))
+            ELSE:
+                dead_letter_queue.enqueue(job)
+                alert_on_call_team(job)
+                ACKNOWLEDGE job
+ 
+ 
+// ─── STEP 4: Push Worker ──────────────────────────────────────────
+ 
+WORKER push_worker CONSUMES push_queue:
+ 
+    ON receive(job):
+        TRY:
+            FOR EACH student_id IN job.student_ids:
+                sse_channel.publish(student_id, {
+                    event   : "new_notification",
+                    payload : job.message
+                })
+            ACKNOWLEDGE job
+ 
+        ON FAILURE:
+            IF job.retry_count < MAX_RETRIES:
+                retry_queue.enqueue(job, delay = backoff(job.retry_count))
+            ELSE:
+                dead_letter_queue.enqueue(job)
+                ACKNOWLEDGE job
+ 
+ 
+// ─── STEP 5: Retry Worker ─────────────────────────────────────────
+ 
+WORKER retry_worker CONSUMES retry_queue:
+ 
+    ON receive(job):
+        job.retry_count = job.retry_count + 1
+        original_queue  = determine_queue(job.type)  // email or push
+        original_queue.enqueue(job)
+        ACKNOWLEDGE job
+ 
+ 
+// ─── HELPER ───────────────────────────────────────────────────────
+ 
+FUNCTION backoff(retry_count):
+    RETURN 30 seconds * (2 ^ retry_count)
+    // retry 1 → 30s,  retry 2 → 60s,  retry 3 → 120s ...
+```
+ 
+---
+ 
+## Benefits
+ 
+**Reliability.**  
+The database write happens before any delivery is attempted. Regardless of whether the email API fails, times out, or crashes, every student's notification record exists in the database. Delivery can be retried at any time from that durable record. A failure in the email service at student 200 does not affect students 201 through 50,000 — their queue jobs are already enqueued and will be processed independently.
+ 
+**Scalability.**  
+Workers are stateless and horizontally scalable. If 50,000 students is taking too long, run 10 email workers in parallel and throughput increases tenfold. The queue acts as a buffer between the rate of job production (fan-out) and the rate of job consumption (workers), allowing each to scale independently based on load.
+ 
+**Performance.**  
+The HR-facing API responds in milliseconds regardless of how many students will be notified. The broadcast is processed asynchronously in the background. Email delivery is batched — instead of 50,000 individual API calls, the email worker makes 500 calls with 100 recipients each, which is both faster and less likely to hit rate limits.
+ 
+**Fault Tolerance.**  
+Every failure mode is handled explicitly. Transient failures are retried with exponential backoff. Persistent failures are routed to a DLQ and trigger an alert. A worker crash does not lose jobs — the queue holds unacknowledged messages until a worker picks them up. The system can survive email provider outages, database slowdowns, and partial worker failures without losing notification state.
+ 
+**Maintainability.**  
+Each component — intake API, fan-out worker, email worker, push worker, retry worker — has a single responsibility and can be developed, deployed, monitored, and scaled independently. If the email provider is swapped, only the email worker changes. If the push mechanism changes, only the push worker changes. The fan-out and intake layers are unaffected.
+ 
+---
+ 
+## Summary
+ 
+| Aspect | Original Implementation | Redesigned Implementation |
+|---|---|---|
+| Processing model | Sequential, synchronous | Asynchronous, parallel workers |
+| API response time | Minutes to hours (blocked) | Milliseconds (202 Accepted immediately) |
+| Email failure at student 200 | Remaining 49,800 unnotified, state unknown | Job remains in queue, retried automatically |
+| DB and email coupling | Tightly coupled in same loop | Decoupled — DB write first, delivery async |
+| Retry on failure | None | Exponential backoff, configurable max retries |
+| Unprocessable failures | Silent loss | Dead Letter Queue with alert |
+| Scalability | Single process, not scalable | Workers scale horizontally |
+| Batching | No | Email sent in batches of 100 |
+| Visibility | None | Job status in DB, DLQ for failed jobs |
+| Recovery from crash | Manual re-run with duplication risk | Queue redelivers unacknowledged messages |
+ 
+The fundamental shift in the redesign is the separation of **acknowledgement** from **delivery**. The system acknowledges that a notification *will be sent* the moment it is persisted and queued. Actual delivery is a best-effort, retryable, observable downstream process — not a blocking condition for the system to move forward.
+ 
+---
+ 
+*End of Stage 5 — Reliable Broadcast Architecture*
+ 
